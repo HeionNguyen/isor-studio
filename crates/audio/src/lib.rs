@@ -61,6 +61,17 @@ pub fn render(project: &Project, tracks: &[Track], rate: u32) -> Result<Vec<[f32
     Ok(pcm)
 }
 
+/// Device-independent PCM shared between successive transport starts.
+pub struct Clip(Arc<[[f32; 2]]>);
+
+impl Clip {
+    const RATE: u32 = 48_000;
+
+    pub fn prepare(project: &Project, tracks: &[Track]) -> Result<Self, AudioError> {
+        Ok(Self(render(project, tracks, Self::RATE)?.into()))
+    }
+}
+
 pub struct Playback {
     _stream: cpal::Stream,
     position: Arc<AtomicUsize>,
@@ -71,13 +82,13 @@ impl Playback {
         self.position.load(Ordering::Relaxed)
     }
 
-    pub fn start(project: &Project, tracks: &[Track], offset: usize) -> Result<Self, AudioError> {
+    pub fn start(clip: &Clip, offset: usize) -> Result<Self, AudioError> {
         let device = cpal::default_host()
             .default_output_device()
             .ok_or("no output device")?;
         let supported = device.default_output_config()?;
         let config = supported.config();
-        let pcm = render(project, tracks, config.sample_rate.0)?;
+        let pcm = clip.0.clone();
         let position = Arc::new(AtomicUsize::new(offset % pcm.len()));
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => stream::<f32>,
@@ -96,16 +107,21 @@ impl Playback {
 fn stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    pcm: Vec<[f32; 2]>,
+    pcm: Arc<[[f32; 2]]>,
     position: Arc<AtomicUsize>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
-    let mut cursor = position.load(Ordering::Relaxed);
+    let mut cursor = position.load(Ordering::Relaxed) as f64;
+    let step = f64::from(Clip::RATE) / f64::from(config.sample_rate.0);
     let channels = usize::from(config.channels);
     device.build_output_stream(
         config,
         move |out: &mut [T], _| {
             for frame in out.chunks_mut(channels) {
-                let [l, r] = pcm[cursor];
+                let i = cursor as usize;
+                let [l, r] = pcm[i];
+                let [next_l, next_r] = pcm[(i + 1) % pcm.len()];
+                let fraction = (cursor - i as f64) as f32;
+                let (l, r) = (l + fraction * (next_l - l), r + fraction * (next_r - r));
                 for (channel, sample) in frame.iter_mut().enumerate() {
                     let value = if channels == 1 {
                         (l + r) * 0.5
@@ -118,9 +134,9 @@ fn stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
                     };
                     *sample = T::from_sample(value.clamp(-1.0, 1.0));
                 }
-                cursor = (cursor + 1) % pcm.len();
+                cursor = (cursor + step) % pcm.len() as f64;
             }
-            position.store(cursor, Ordering::Relaxed);
+            position.store(cursor as usize, Ordering::Relaxed);
         },
         |err| eprintln!("audio device error: {err}"),
         None,
