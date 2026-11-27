@@ -25,6 +25,25 @@ pub fn decode(text: &str) -> Result<Option<Update>> {
     })
 }
 
+fn outgoing_request(id: u64, mut command: Command) -> Result<Request> {
+    if let Command::LoadProject { path } = &mut command
+        && path.is_relative()
+    {
+        let cwd = std::env::current_dir().with_context(|| {
+            format!(
+                "Resolving project path {} from the app working directory",
+                path.display()
+            )
+        })?;
+        *path = cwd.join(&*path);
+    }
+    Ok(Request {
+        jsonrpc: Version::V2,
+        id,
+        command,
+    })
+}
+
 pub async fn connect(commands: Receiver<Command>, updates: Sender<Update>) -> Result<()> {
     let url = shared::DEFAULT_WS_URL;
     let address = url.strip_prefix("ws://").context("Invalid backend URL")?;
@@ -38,7 +57,7 @@ pub async fn connect(commands: Receiver<Command>, updates: Sender<Update>) -> Re
             command = commands.recv().fuse() => {
                 let Ok(command) = command else { return Ok(()) };
                 id += 1;
-                let request = Request { jsonrpc: Version::V2, id, command };
+                let request = outgoing_request(id, command)?;
                 socket.send(Message::text(serde_json::to_string(&request)?)).await?;
             },
             frame = socket.next().fuse() => match frame.transpose()? {
@@ -52,5 +71,33 @@ pub async fn connect(commands: Receiver<Command>, updates: Sender<Update>) -> Re
                 _ => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_load_project_resolves_from_app_even_when_daemon_cwd_differs() {
+        let app_cwd = std::env::current_dir().unwrap();
+        let daemon_cwd = app_cwd.join("daemon");
+        let relative = std::path::Path::new("songs/project.yaml");
+        let request = outgoing_request(
+            1,
+            Command::LoadProject {
+                path: relative.into(),
+            },
+        )
+        .unwrap();
+        let wire = serde_json::to_string(&request).unwrap();
+        let Request {
+            command: Command::LoadProject { path },
+            ..
+        } = serde_json::from_str(&wire).unwrap()
+        else {
+            panic!("expected LoadProject")
+        };
+        assert_eq!(daemon_cwd.join(path), app_cwd.join(relative));
     }
 }
