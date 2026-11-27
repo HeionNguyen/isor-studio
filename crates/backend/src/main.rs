@@ -225,8 +225,20 @@ async fn serve() -> Result<()> {
         Daemon::load(&daemon, Some(path.into())).await?;
     }
     tokio::task::spawn_local(watch_edits(daemon.clone(), edits));
+    let mut health_check = tokio::time::interval(Duration::from_millis(100));
     loop {
-        let (socket, _) = listener.accept().await?;
+        let (socket, _) = tokio::select! {
+            connection = listener.accept() => connection?,
+            _ = health_check.tick() => {
+                let mut daemon = daemon.borrow_mut();
+                if let Some(message) = daemon.playback.as_ref().and_then(Playback::failure) {
+                    eprintln!("{message}");
+                    daemon.playback = None;
+                    daemon.changed();
+                }
+                continue;
+            }
+        };
         let daemon = daemon.clone();
         tokio::task::spawn_local(async move {
             if let Err(e) = client(socket, daemon).await {

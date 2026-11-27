@@ -6,7 +6,7 @@ use std::{
     error::Error,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
 };
 
@@ -72,12 +72,39 @@ impl Clip {
     }
 }
 
+#[derive(Default)]
+struct StreamFailure(AtomicU8);
+
+impl StreamFailure {
+    // CPAL can invoke this on the render thread. Only publish an error code.
+    fn signal(&self, error: &cpal::StreamError) {
+        let code = match error {
+            cpal::StreamError::DeviceNotAvailable => 1,
+            cpal::StreamError::BackendSpecific { .. } => 2,
+        };
+        self.0.store(code, Ordering::Relaxed);
+    }
+
+    fn message(&self) -> Option<&'static str> {
+        match self.0.load(Ordering::Relaxed) {
+            1 => Some("audio output device is no longer available"),
+            2 => Some("audio output stream reported a backend failure"),
+            _ => None,
+        }
+    }
+}
+
 pub struct Playback {
     _stream: cpal::Stream,
+    failure: Arc<StreamFailure>,
     position: Arc<AtomicUsize>,
 }
 
 impl Playback {
+    pub fn failure(&self) -> Option<&'static str> {
+        self.failure.message()
+    }
+
     pub fn position(&self) -> usize {
         self.position.load(Ordering::Relaxed)
     }
@@ -90,15 +117,17 @@ impl Playback {
         let config = supported.config();
         let pcm = clip.0.clone();
         let position = Arc::new(AtomicUsize::new(offset % pcm.len()));
+        let failure = Arc::<StreamFailure>::default();
         let stream = match supported.sample_format() {
             cpal::SampleFormat::F32 => stream::<f32>,
             cpal::SampleFormat::I16 => stream::<i16>,
             cpal::SampleFormat::U16 => stream::<u16>,
             _ => return Err("unsupported output sample format".into()),
-        }(&device, &config, pcm, position.clone())?;
+        }(&device, &config, pcm, position.clone(), failure.clone())?;
         stream.play()?;
         Ok(Self {
             _stream: stream,
+            failure,
             position,
         })
     }
@@ -109,6 +138,7 @@ fn stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
     config: &cpal::StreamConfig,
     pcm: Arc<[[f32; 2]]>,
     position: Arc<AtomicUsize>,
+    failure: Arc<StreamFailure>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError> {
     let mut cursor = position.load(Ordering::Relaxed) as f64;
     let step = f64::from(Clip::RATE) / f64::from(config.sample_rate.0);
@@ -138,7 +168,34 @@ fn stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
             }
             position.store(cursor as usize, Ordering::Relaxed);
         },
-        |err| eprintln!("audio device error: {err}"),
+        move |error| failure.signal(&error),
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_thread_reads_stream_failure_after_callback_returns() {
+        let failure = Arc::<StreamFailure>::default();
+        assert_eq!(failure.message(), None);
+        std::thread::scope(|scope| {
+            scope.spawn(|| failure.signal(&cpal::StreamError::DeviceNotAvailable));
+        });
+        assert_eq!(
+            failure.message(),
+            Some("audio output device is no longer available")
+        );
+        failure.signal(&cpal::StreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: "test".into(),
+            },
+        });
+        assert_eq!(
+            failure.message(),
+            Some("audio output stream reported a backend failure")
+        );
+    }
 }
