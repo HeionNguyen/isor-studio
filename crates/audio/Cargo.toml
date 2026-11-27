@@ -3,3 +3,7 @@ name = "audio"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
+
+[dependencies]
+cpal = "0.15"
+shared = { path = "../shared" }
