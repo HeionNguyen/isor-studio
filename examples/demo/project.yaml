@@ -1,0 +1,8 @@
+version: 0
+title: First Light
+bpm: 120
+time_signature: [4, 4]
+key: C
+sections:
+  - { name: Intro, start_bar: 0, bars: 1 }
+tracks: [lead]

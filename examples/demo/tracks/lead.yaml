@@ -1,0 +1,7 @@
+id: lead
+instrument: basic_synth
+mixer: { volume: 0.7, pan: 0, mute: false, solo: false }
+patterns:
+  - start_beat: 0
+    notes:
+      - { start_beat: 0, duration_beats: 1, pitch: 69, velocity: 96 }
