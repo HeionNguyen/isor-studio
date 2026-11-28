@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/shared", "crates/audio", "crates/backend", "crates/app"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }
