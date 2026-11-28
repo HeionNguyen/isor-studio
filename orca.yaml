@@ -1,2 +1,6 @@
 scripts:
-  setup: cargo fetch --locked
+  setup: |
+    cp "$ORCA_ROOT_PATH/.env.local" .env 2>/dev/null || true
+    cargo fetch --locked
+  archive: |
+    rm -rf target
