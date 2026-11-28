@@ -177,6 +177,30 @@ fn stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a live CoreAudio default output device"]
+    fn coreaudio_renders_and_releases_callback_storage_on_stop() -> Result<(), AudioError> {
+        use std::time::{Duration, Instant};
+        for _ in 0..8 {
+            let clip = Clip(vec![[0.0, 0.0]; 48_000].into());
+            let pcm = Arc::downgrade(&clip.0);
+            let playback = Playback::start(&clip, 0)?;
+            let failure = Arc::downgrade(&playback.failure);
+            drop(clip);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while playback.position() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_ne!(playback.position(), 0);
+            assert!(playback.failure().is_none());
+            drop(playback);
+            assert!(pcm.upgrade().is_none());
+            assert!(failure.upgrade().is_none());
+        }
+        Ok(())
+    }
+
     #[test]
     fn control_thread_reads_stream_failure_after_callback_returns() {
         let failure = Arc::<StreamFailure>::default();
