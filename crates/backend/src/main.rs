@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use audio::{Clip, Playback};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::FuturesOrdered};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use shared::*;
 use std::{
@@ -8,6 +8,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -46,7 +50,14 @@ impl Song {
     }
 }
 
-fn watch(path: &Path, dirty: mpsc::Sender<()>) -> Result<RecommendedWatcher> {
+struct ProjectWatcher {
+    _watcher: RecommendedWatcher,
+    dirty: Arc<AtomicBool>,
+}
+
+fn watch(path: &Path, wake: mpsc::Sender<()>) -> Result<ProjectWatcher> {
+    let dirty = Arc::<AtomicBool>::default();
+    let signal = dirty.clone();
     let root = path.parent().context("missing project directory")?;
     let manifest = path.to_owned();
     let track_dir = root.join("tracks");
@@ -58,21 +69,26 @@ fn watch(path: &Path, dirty: mpsc::Sender<()>) -> Result<RecommendedWatcher> {
                         .iter()
                         .any(|p| p == &manifest || p.starts_with(&track_dir)) =>
             {
-                let _ = dirty.try_send(());
+                signal.store(true, Ordering::Release);
+                let _ = wake.try_send(());
             }
             Err(e) => eprintln!("watch error: {e}"),
             _ => {}
         })?;
     watcher.watch(root, RecursiveMode::Recursive)?;
-    Ok(watcher)
+    Ok(ProjectWatcher {
+        _watcher: watcher,
+        dirty,
+    })
 }
 
 struct Daemon {
-    watcher: Option<RecommendedWatcher>,
+    watcher: Option<ProjectWatcher>,
+    revision: u64,
     loads: Rc<tokio::sync::Mutex<()>>,
     song: Option<Song>,
     playback: Option<Playback>,
-    events: broadcast::Sender<Event>,
+    events: broadcast::Sender<(u64, Event)>,
     dirty: mpsc::Sender<()>,
 }
 impl Daemon {
@@ -83,13 +99,28 @@ impl Daemon {
             playing: self.playback.is_some(),
         }
     }
-    fn changed(&self) {
-        let _ = self.events.send(Event::StateChanged(self.state()));
+    fn changed(&mut self) {
+        self.revision += 1;
+        let _ = self
+            .events
+            .send((self.revision, Event::StateChanged(self.state())));
     }
     async fn load(daemon: &Rc<RefCell<Self>>, path: Option<PathBuf>) -> Result<()> {
         let loads = daemon.borrow().loads.clone();
         let _guard = loads.lock().await;
         let reload = path.is_none();
+        // Wakes are coalesced globally, but the dirty bit belongs to the
+        // registration. Test it after acquiring the load lock so a queued
+        // wake from a retired watcher cannot reload the replacement project.
+        if reload
+            && !daemon
+                .borrow()
+                .watcher
+                .as_ref()
+                .is_some_and(|w| w.dirty.swap(false, Ordering::AcqRel))
+        {
+            return Ok(());
+        }
         let Some(path) = path.or_else(|| daemon.borrow().song.as_ref().map(|s| s.path.clone()))
         else {
             return Ok(());
@@ -141,61 +172,80 @@ impl Daemon {
         }
         Ok(Reply::State(daemon.borrow().state()))
     }
-    async fn respond(daemon: &Rc<RefCell<Self>>, text: &str) -> Response {
-        let (id, outcome) = match serde_json::from_str::<serde_json::Value>(text) {
-            Err(e) => (
-                None,
-                Outcome::Error(RpcError {
-                    code: -32700,
-                    message: e.to_string(),
-                }),
-            ),
-            Ok(value) => {
-                let id = value.get("id").and_then(|v| v.as_u64());
-                let outcome = match serde_json::from_value::<Request>(value) {
-                    Ok(req) => match Self::command(daemon, req.command).await {
-                        Ok(reply) => Outcome::Result(reply),
-                        Err(e) => Outcome::Error(RpcError {
-                            code: -32000,
-                            message: format!("{e:#}"),
-                        }),
-                    },
-                    Err(e) => Outcome::Error(RpcError {
-                        code: -32600,
-                        message: e.to_string(),
-                    }),
-                };
-                (id, outcome)
-            }
+    async fn respond(daemon: &Rc<RefCell<Self>>, request: Request) -> Response {
+        let outcome = match Self::command(daemon, request.command).await {
+            Ok(reply) => Outcome::Result(reply),
+            Err(error) => Outcome::Error(RpcError {
+                code: -32000,
+                message: format!("{error:#}"),
+            }),
         };
         Response {
             jsonrpc: Version::V2,
-            id,
+            id: Some(request.id),
             outcome,
         }
     }
 }
 
+fn parse_request(text: &str) -> Result<Request, Response> {
+    let error = |id, code, message| Response {
+        jsonrpc: Version::V2,
+        id,
+        outcome: Outcome::Error(RpcError { code, message }),
+    };
+    let value = serde_json::from_str::<serde_json::Value>(text)
+        .map_err(|e| error(None, -32700, e.to_string()))?;
+    let id = value.get("id").and_then(|v| v.as_u64());
+    serde_json::from_value(value).map_err(|e| error(id, -32600, e.to_string()))
+}
+
 async fn client(socket: TcpStream, daemon: Rc<RefCell<Daemon>>) -> Result<()> {
     let mut ws = accept_async(socket).await?;
     let mut events = daemon.borrow().events.subscribe();
+    let mut loads = FuturesOrdered::new();
+    let mut snapshot_revision = 0;
     loop {
-        let json = tokio::select! {
+        let response = tokio::select! {
+            biased;
+            Some(response) = loads.next(), if !loads.is_empty() => response,
             msg = ws.next() => match msg.transpose()? {
-                Some(Message::Text(text)) => serde_json::to_string(&Daemon::respond(&daemon, &text).await)?,
+                Some(Message::Text(text)) => match parse_request(&text) {
+                    Err(error) => error,
+                    Ok(req) if matches!(req.command,Command::LoadProject { .. }) => {
+                        if loads.len() < 16 {
+                            loads.push_back(Daemon::respond(&daemon,req));
+                            continue;
+                        }
+                        Response { jsonrpc:Version::V2,id:Some(req.id),outcome:Outcome::Error(RpcError {code:-32000,message:"too many pending project loads".into()}) }
+                    }
+                    Ok(req) => Daemon::respond(&daemon,req).await,
+                }
                 Some(Message::Close(_)) | None => break,
                 Some(_) => { ws.flush().await?; continue }
             },
             event = events.recv() => {
-                let event = match event {
+                let (revision,event) = match event {
                     Ok(event) => event,
-                    Err(broadcast::error::RecvError::Lagged(_)) => Event::StateChanged(daemon.borrow().state()),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let current = daemon.borrow();
+                        events = current.events.subscribe();
+                        (current.revision,Event::StateChanged(current.state()))
+                    },
                     Err(_) => break
                 };
-                serde_json::to_string(&Notification {jsonrpc:Version::V2,event})?
+                if revision < snapshot_revision {continue}
+                snapshot_revision = revision;
+                let json = serde_json::to_string(&Notification {jsonrpc:Version::V2,event})?;
+                ws.send(Message::text(json)).await?;
+                continue;
             }
         };
-        ws.send(Message::text(json)).await?;
+        if matches!(response.outcome, Outcome::Result(Reply::State(_))) {
+            snapshot_revision = daemon.borrow().revision;
+        }
+        ws.send(Message::text(serde_json::to_string(&response)?))
+            .await?;
     }
     Ok(())
 }
@@ -216,6 +266,7 @@ async fn serve() -> Result<()> {
     let daemon = Rc::new(RefCell::new(Daemon {
         loads: Default::default(),
         watcher: None,
+        revision: 0,
         song: None,
         playback: None,
         events: broadcast::channel(64).0,
@@ -253,9 +304,13 @@ async fn watch_edits(daemon: Rc<RefCell<Daemon>>, mut edits: mpsc::Receiver<()>)
         tokio::time::sleep(Duration::from_millis(60)).await;
         let _ = edits.try_recv();
         if let Err(e) = Daemon::load(&daemon, None).await {
-            let _ = daemon.borrow().events.send(Event::ValidationError {
-                message: format!("{e:#}"),
-            });
+            let daemon = daemon.borrow();
+            let _ = daemon.events.send((
+                daemon.revision,
+                Event::ValidationError {
+                    message: format!("{e:#}"),
+                },
+            ));
         }
     }
 }
@@ -269,6 +324,7 @@ mod tests {
         let daemon = Rc::new(RefCell::new(Daemon {
             loads: Default::default(),
             watcher: None,
+            revision: 0,
             song: None,
             playback: None,
             events: broadcast::channel(8).0,
@@ -288,6 +344,142 @@ mod tests {
         Ok(dir)
     }
 
+    type Socket = tokio_tungstenite::WebSocketStream<TcpStream>;
+
+    async fn connect(daemon: Rc<RefCell<Daemon>>) -> Result<Socket> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::task::spawn_local(async move {
+            let (socket, _) = listener.accept().await?;
+            client(socket, daemon).await
+        });
+        let (ws, _) = tokio_tungstenite::client_async(
+            format!("ws://{addr}"),
+            TcpStream::connect(addr).await?,
+        )
+        .await?;
+        Ok(ws)
+    }
+
+    async fn send(ws: &mut Socket, id: u64, command: Command) -> Result<()> {
+        ws.send(Message::text(serde_json::to_string(&Request {
+            jsonrpc: Version::V2,
+            id,
+            command,
+        })?))
+        .await?;
+        Ok(())
+    }
+
+    async fn receive(ws: &mut Socket) -> Result<serde_json::Value> {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await?
+            .context("socket closed")??;
+        Ok(serde_json::from_str(msg.to_text()?)?)
+    }
+
+    #[tokio::test]
+    async fn same_socket_transport_during_load_and_ordered_snapshots() -> Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let dir = demo_copy()?;
+                let (daemon, _edits) = fixture();
+                let mut ws = connect(daemon.clone()).await?;
+                let loads = daemon.borrow().loads.clone();
+                let guard = loads.lock().await;
+                send(
+                    &mut ws,
+                    1,
+                    Command::LoadProject {
+                        path: dir.path().join("project.yaml"),
+                    },
+                )
+                .await?;
+                send(&mut ws, 2, Command::Stop).await?;
+                send(&mut ws, 3, Command::GetState).await?;
+                for expected in [2, 3] {
+                    loop {
+                        let msg = receive(&mut ws).await?;
+                        if msg.get("id").is_some() {
+                            assert_eq!(msg["id"], expected);
+                            assert_eq!(msg["result"]["state"]["playing"], false);
+                            assert!(msg["result"]["state"]["title"].is_null());
+                            break;
+                        }
+                    }
+                }
+                let (old_revision, old_state) = {
+                    let d = daemon.borrow();
+                    (d.revision, d.state())
+                };
+                drop(guard);
+                while receive(&mut ws).await?["id"] != 1 {}
+                // Deliver history retained by the broadcast queue after this client
+                // has received a later authoritative LoadProject response.
+                {
+                    let d = daemon.borrow();
+                    d.events
+                        .send((old_revision, Event::StateChanged(old_state)))?;
+                    d.events.send((
+                        d.revision,
+                        Event::ValidationError {
+                            message: "end of batch".into(),
+                        },
+                    ))?;
+                }
+                loop {
+                    let msg = receive(&mut ws).await?;
+                    if msg["method"] == "ValidationError" {
+                        break;
+                    }
+                    assert_eq!(msg["params"]["title"], "First Light");
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn retired_watcher_wake_cannot_reload_new_websocket_project() -> Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let old = demo_copy()?;
+                let new = demo_copy()?;
+                let (daemon, mut edits) = fixture();
+                Daemon::load(&daemon, Some(old.path().join("project.yaml"))).await?;
+                let mut ws = connect(daemon.clone()).await?;
+                fs::write(old.path().join("tracks/lead.yaml"), "patterns: [")?;
+                // Hold the real notify wake through the replacement, just as a
+                // pending debounce or load lock can delay its consumption.
+                tokio::time::timeout(Duration::from_secs(5), edits.recv())
+                    .await?
+                    .context("watcher stopped")?;
+                send(
+                    &mut ws,
+                    1,
+                    Command::LoadProject {
+                        path: new.path().join("project.yaml"),
+                    },
+                )
+                .await?;
+                while receive(&mut ws).await?["id"] != 1 {}
+                let revision = daemon.borrow().revision;
+                Daemon::load(&daemon, None).await?;
+                assert_eq!(daemon.borrow().revision, revision);
+                send(&mut ws, 2, Command::GetState).await?;
+                loop {
+                    let msg = receive(&mut ws).await?;
+                    if msg["id"] == 2 {
+                        assert_eq!(msg["result"]["state"]["title"], "First Light");
+                        break;
+                    }
+                    assert_ne!(msg["method"], "ValidationError");
+                }
+                Ok(())
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn watcher_recovers_after_partial_track_rewrite() -> Result<()> {
         let dir = demo_copy()?;
@@ -298,14 +490,14 @@ mod tests {
             let track = dir.path().join("tracks/lead.yaml");
             fs::write(&track, "patterns: [")?;
             loop {
-                if matches!(events.recv().await?, Event::ValidationError { .. }) {
+                if matches!(events.recv().await?.1, Event::ValidationError { .. }) {
                     break;
                 }
             }
             assert_eq!(daemon.borrow().state().bpm, Some(120));
             fs::write(&track, TRACK.replace("pitch: 69", "pitch: 81"))?;
             loop {
-                if matches!(events.recv().await?, Event::StateChanged(_)) {
+                if matches!(events.recv().await?.1, Event::StateChanged(_)) {
                     break;
                 }
             }
@@ -327,6 +519,13 @@ mod tests {
             dir.path().join("tracks/lead.yaml"),
             TRACK.replace("duration_beats: 1", "duration_beats: 300"),
         )?;
+        daemon
+            .borrow()
+            .watcher
+            .as_ref()
+            .context("missing watcher")?
+            .dirty
+            .store(true, Ordering::Release);
         let reload = Daemon::load(&daemon, None);
         tokio::pin!(reload);
         // Poll the reload first. A synchronous renderer completes here before
@@ -366,7 +565,7 @@ mod tests {
             id: 42,
             command: Command::GetState,
         };
-        let response = Daemon::respond(&daemon, &serde_json::to_string(&request)?).await;
+        let response = Daemon::respond(&daemon, request).await;
         assert_eq!(response.id, Some(42));
         assert_eq!(
             response.outcome,
