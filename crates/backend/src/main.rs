@@ -5,6 +5,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use shared::*;
 use std::{
     cell::RefCell,
+    collections::VecDeque,
     fs,
     path::{Path, PathBuf},
     rc::Rc,
@@ -85,6 +86,9 @@ fn watch(path: &Path, wake: mpsc::Sender<()>) -> Result<ProjectWatcher> {
 struct Daemon {
     watcher: Option<ProjectWatcher>,
     revision: u64,
+    song_revision: u64,
+    project_id: u64,
+    stop_epoch: u64,
     loads: Rc<tokio::sync::Mutex<()>>,
     song: Option<Song>,
     playback: Option<Playback>,
@@ -144,7 +148,9 @@ impl Daemon {
         };
         if watcher.is_some() {
             daemon.watcher = watcher;
+            daemon.project_id += 1;
         }
+        daemon.song_revision = daemon.revision + 1;
         daemon.song = Some(song);
         daemon.playback = playback;
         daemon.changed();
@@ -165,6 +171,7 @@ impl Daemon {
             }
             Command::Stop => {
                 let mut daemon = daemon.borrow_mut();
+                daemon.stop_epoch += 1;
                 daemon.playback = None;
                 daemon.changed();
             }
@@ -200,24 +207,87 @@ fn parse_request(text: &str) -> Result<Request, Response> {
     serde_json::from_value(value).map_err(|e| error(id, -32600, e.to_string()))
 }
 
+fn rejected(id: u64, message: &str) -> Response {
+    Response {
+        jsonrpc: Version::V2,
+        id: Some(id),
+        outcome: Outcome::Error(RpcError {
+            code: -32000,
+            message: message.into(),
+        }),
+    }
+}
+
+// Load and the Plays following it are FIFO within a socket. Stop and
+// GetState bypass the queue. A Stop invalidates already enqueued Plays.
+async fn ordered(
+    daemon: &Rc<RefCell<Daemon>>,
+    request: Request,
+    stop_epoch: u64,
+    target: Option<u64>,
+) -> (Response, Option<u64>) {
+    if matches!(request.command, Command::LoadProject { .. }) {
+        let response = Daemon::respond(daemon, request).await;
+        let target =
+            matches!(response.outcome, Outcome::Result(_)).then(|| daemon.borrow().project_id);
+        return (response, target);
+    }
+    if daemon.borrow().stop_epoch != stop_epoch {
+        let state = Reply::State(daemon.borrow().state());
+        return (
+            Response {
+                jsonrpc: Version::V2,
+                id: Some(request.id),
+                outcome: Outcome::Result(state),
+            },
+            target,
+        );
+    }
+    if target != Some(daemon.borrow().project_id) {
+        return (
+            rejected(request.id, "requested project is unavailable"),
+            target,
+        );
+    }
+    (Daemon::respond(daemon, request).await, target)
+}
+
 async fn client(socket: TcpStream, daemon: Rc<RefCell<Daemon>>) -> Result<()> {
-    let mut ws = accept_async(socket).await?;
-    let mut events = daemon.borrow().events.subscribe();
-    let mut loads = FuturesOrdered::new();
+    let ws = accept_async(socket).await?;
+    let events = daemon.borrow().events.subscribe();
+    serve_client(ws, daemon, events).await
+}
+
+async fn serve_client(
+    mut ws: tokio_tungstenite::WebSocketStream<TcpStream>,
+    daemon: Rc<RefCell<Daemon>>,
+    mut events: broadcast::Receiver<(u64, Event)>,
+) -> Result<()> {
+    let mut active = FuturesOrdered::new();
+    let mut queue = VecDeque::new();
+    let mut target = None;
+    let mut rejected_load = false;
     let mut snapshot_revision = 0;
     loop {
+        if active.is_empty()
+            && let Some((request, epoch)) = queue.pop_front()
+        {
+            active.push_back(ordered(&daemon, request, epoch, target));
+        }
         let response = tokio::select! {
             biased;
-            Some(response) = loads.next(), if !loads.is_empty() => response,
+            Some((response,project)) = active.next(), if !active.is_empty() => {target = project; response},
             msg = ws.next() => match msg.transpose()? {
                 Some(Message::Text(text)) => match parse_request(&text) {
                     Err(error) => error,
-                    Ok(req) if matches!(req.command,Command::LoadProject { .. }) => {
-                        if loads.len() < 16 {
-                            loads.push_back(Daemon::respond(&daemon,req));
-                            continue;
+                    Ok(req) if rejected_load && matches!(req.command,Command::Play) => rejected(req.id,"preceding load was rejected"),
+                    Ok(req) if matches!(req.command,Command::LoadProject { .. }) || (!active.is_empty() && matches!(req.command,Command::Play)) => {
+                        let full = queue.len() >= 16;
+                        if matches!(req.command,Command::LoadProject { .. }) { rejected_load = full; }
+                        if full { rejected(req.id,"too many pending transport commands") } else {
+                            queue.push_back((req,daemon.borrow().stop_epoch));
+                            continue
                         }
-                        Response { jsonrpc:Version::V2,id:Some(req.id),outcome:Outcome::Error(RpcError {code:-32000,message:"too many pending project loads".into()}) }
                     }
                     Ok(req) => Daemon::respond(&daemon,req).await,
                 }
@@ -234,8 +304,12 @@ async fn client(socket: TcpStream, daemon: Rc<RefCell<Daemon>>) -> Result<()> {
                     },
                     Err(_) => break
                 };
-                if revision < snapshot_revision {continue}
-                snapshot_revision = revision;
+                match event {
+                    Event::StateChanged(_) if revision < snapshot_revision => continue,
+                    Event::StateChanged(_) => snapshot_revision = revision,
+                    Event::ValidationError { .. } if revision < daemon.borrow().song_revision => continue,
+                    Event::ValidationError { .. } => {}
+                }
                 let json = serde_json::to_string(&Notification {jsonrpc:Version::V2,event})?;
                 ws.send(Message::text(json)).await?;
                 continue;
@@ -267,6 +341,9 @@ async fn serve() -> Result<()> {
         loads: Default::default(),
         watcher: None,
         revision: 0,
+        song_revision: 0,
+        project_id: 0,
+        stop_epoch: 0,
         song: None,
         playback: None,
         events: broadcast::channel(64).0,
@@ -325,6 +402,9 @@ mod tests {
             loads: Default::default(),
             watcher: None,
             revision: 0,
+            song_revision: 0,
+            project_id: 0,
+            stop_epoch: 0,
             song: None,
             playback: None,
             events: broadcast::channel(8).0,
@@ -433,6 +513,131 @@ mod tests {
                         break;
                     }
                     assert_eq!(msg["params"]["title"], "First Light");
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn response(ws: &mut Socket) -> Result<Response> {
+        loop {
+            let msg = receive(ws).await?;
+            if msg.get("id").is_some() {
+                return Ok(serde_json::from_value(msg)?);
+            }
+        }
+    }
+
+    async fn pipelined_play(cancel: bool, valid_load: bool) -> Result<()> {
+        let dir = demo_copy()?;
+        let (daemon, _edits) = fixture();
+        Daemon::load(&daemon, Some(dir.path().join("project.yaml"))).await?;
+        let new = demo_copy()?;
+        let path = new.path().join("project.yaml");
+        fs::write(
+            &path,
+            if valid_load {
+                PROJECT.replace("First Light", "New song")
+            } else {
+                String::from("invalid: [")
+            },
+        )?;
+        let mut ws = connect(daemon.clone()).await?;
+        let loads = daemon.borrow().loads.clone();
+        let guard = loads.lock().await;
+        send(&mut ws, 1, Command::LoadProject { path }).await?;
+        send(&mut ws, 2, Command::Play).await?;
+        send(&mut ws, 3, Command::GetState).await?;
+        let current = response(&mut ws).await?;
+        assert_eq!(current.id, Some(3));
+        assert!(
+            matches!(current.outcome,Outcome::Result(Reply::State(State {title:Some(title),playing:false,..})) if title=="First Light")
+        );
+        if cancel {
+            send(&mut ws, 4, Command::Stop).await?;
+            assert_eq!(response(&mut ws).await?.id, Some(4));
+        }
+        drop(guard);
+        let load = response(&mut ws).await?;
+        assert_eq!(load.id, Some(1));
+        let play = response(&mut ws).await?;
+        assert_eq!(play.id, Some(2));
+        if valid_load {
+            assert!(matches!(load.outcome, Outcome::Result(_)));
+            assert!(
+                matches!(play.outcome,Outcome::Result(Reply::State(State {title:Some(title),playing,..})) if title=="New song" && playing!=cancel)
+            );
+        } else {
+            assert!(matches!(load.outcome, Outcome::Error(_)));
+            assert!(matches!(play.outcome, Outcome::Error(_)));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_stop_cancels_queued_play_and_failed_load_preserves_old_transport() -> Result<()>
+    {
+        LocalSet::new()
+            .run_until(async {
+                pipelined_play(true, true).await?;
+                pipelined_play(false, false).await
+            })
+            .await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live default output device"]
+    async fn play_after_pending_load_starts_requested_project() -> Result<()> {
+        LocalSet::new().run_until(pipelined_play(false, true)).await
+    }
+
+    #[tokio::test]
+    async fn stop_preserves_pending_validation_for_current_song() -> Result<()> {
+        LocalSet::new()
+            .run_until(async {
+                let dir = demo_copy()?;
+                let (daemon, _edits) = fixture();
+                Daemon::load(&daemon, Some(dir.path().join("project.yaml"))).await?;
+                let listener = TcpListener::bind("127.0.0.1:0").await?;
+                let addr = listener.local_addr()?;
+                let peer = async {
+                    let (tcp, _) = listener.accept().await?;
+                    Ok::<_, anyhow::Error>(accept_async(tcp).await?)
+                };
+                let connect = async {
+                    Ok::<_, anyhow::Error>(
+                        tokio_tungstenite::client_async(
+                            format!("ws://{addr}"),
+                            TcpStream::connect(addr).await?,
+                        )
+                        .await?
+                        .0,
+                    )
+                };
+                let (server, mut ws) = tokio::try_join!(peer, connect)?;
+                let events = daemon.borrow().events.subscribe();
+                send(&mut ws, 1, Command::Stop).await?;
+                server.get_ref().readable().await?;
+                {
+                    let d = daemon.borrow();
+                    d.events.send((
+                        d.revision,
+                        Event::ValidationError {
+                            message: "partial YAML".into(),
+                        },
+                    ))?;
+                }
+                tokio::task::spawn_local(serve_client(server, daemon, events));
+                let mut saw_stop = false;
+                loop {
+                    let msg = receive(&mut ws).await?;
+                    if msg["id"] == 1 {
+                        saw_stop = true;
+                    }
+                    if msg["method"] == "ValidationError" {
+                        assert!(saw_stop, "Stop response should precede buffered diagnostic");
+                        break;
+                    }
                 }
                 Ok(())
             })
